@@ -26,8 +26,6 @@ DB_FILE = "users_db.json"
 PARSER_THREADS = 5
 GLOBAL_MAX_CONCURRENT = 10
 
-global_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT)
-
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -206,8 +204,8 @@ async def fetch_google_suggest(session, query):
         return []
 
 async def fetch_suggest_throttled(session, query, sem):
-    async with global_semaphore:
-        async with sem:
+    async with sem:
+        async with global_queue.slot():
             return await fetch_google_suggest(session, query)
 
 async def generate_keywords(session, brand, max_count, status_msg, sem):
@@ -598,7 +596,62 @@ async def _sql_test(session, test_url):
     return None
 
 # ──────────────────────────────────────────────
-#  GOOGLE PARSER (5-thread semaphore)
+#  GLOBAL QUEUE WITH POSITION TRACKING
+# ──────────────────────────────────────────────
+
+class GlobalQueue:
+    def __init__(self, max_concurrent):
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._waiters = []
+        self._lock = asyncio.Lock()
+        self.active = 0
+        self.max = max_concurrent
+
+    async def _add_waiter(self):
+        event = asyncio.Event()
+        async with self._lock:
+            self._waiters.append(event)
+            pos = len(self._waiters)
+        return event, pos
+
+    async def _remove_waiter(self, event):
+        async with self._lock:
+            if event in self._waiters:
+                self._waiters.remove(event)
+
+    def get_queue_length(self):
+        return len(self._waiters)
+
+    def get_position(self, event):
+        try:
+            return self._waiters.index(event) + 1
+        except ValueError:
+            return 0
+
+    class _SlotContext:
+        def __init__(self, queue):
+            self.queue = queue
+
+        async def __aenter__(self):
+            await self.queue._sem.acquire()
+            async with self.queue._lock:
+                self.queue.active += 1
+            return self
+
+        async def __aexit__(self, *args):
+            async with self.queue._lock:
+                self.queue.active -= 1
+                if self.queue._waiters:
+                    self.queue._waiters[0].set()
+            self.queue._sem.release()
+
+    def slot(self):
+        return self._SlotContext(self)
+
+global_queue = GlobalQueue(GLOBAL_MAX_CONCURRENT)
+
+# ──────────────────────────────────────────────
+#  PER-USER SEMAPHORES
 # ──────────────────────────────────────────────
 
 user_semaphores = {}
@@ -608,10 +661,14 @@ def get_semaphore(uid):
         user_semaphores[uid] = asyncio.Semaphore(PARSER_THREADS)
     return user_semaphores[uid]
 
+# ──────────────────────────────────────────────
+#  GOOGLE PARSER (user sem → global queue)
+# ──────────────────────────────────────────────
+
 async def fetch_oxylabs(session, query, sem=None):
     user_sem = sem or asyncio.Semaphore(PARSER_THREADS)
-    async with global_semaphore:
-        async with user_sem:
+    async with user_sem:
+        async with global_queue.slot():
             url = "https://realtime.oxylabs.io/v1/queries"
             payload = {
                 "source": "google_search", "query": query,
@@ -1231,9 +1288,22 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
     item_w = "dorks" if is_parser else "URLs"
     thread_info = f"\n   ⚡ Threads: `{PARSER_THREADS}`\n" if is_parser else "\n"
 
+    queue_len = global_queue.get_queue_length()
+    active = global_queue.active
+    queue_note = ""
+    if active >= global_queue.max:
+        queue_pos = queue_len + 1
+        queue_note = (
+            f"\n\n🚦 *Queue Status:*\n"
+            f"   Active: `{active}/{global_queue.max}` slots\n"
+            f"   Your position: *\\#{queue_pos}*\n"
+            f"   _Your task will start automatically\\._"
+        )
+
     status = await update.message.reply_text(
-        f"{icon} *{esc(label)} — Running*\n{DIV}\n\n"
-        f"   Items: `{len(lines)}` {item_w}\n   Cost: `{cost}` credits{thread_info}\n"
+        f"{icon} *{esc(label)} — {'Queued' if queue_note else 'Running'}*\n{DIV}\n\n"
+        f"   Items: `{len(lines)}` {item_w}\n   Cost: `{cost}` credits{thread_info}"
+        f"{queue_note}\n\n"
         f"{pbar(0, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
         parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -1243,8 +1313,9 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
     try:
         async with aiohttp.ClientSession() as session:
             if is_parser:
+                started = False
                 async def _pw(dork):
-                    nonlocal done_count, errors
+                    nonlocal done_count, errors, started
                     try:
                         urls = await fetch_oxylabs(session, dork, sem)
                         if isinstance(urls, list):
@@ -1254,13 +1325,21 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
                     except Exception as e:
                         logger.error("PW err: %s", e)
                         async with lock: errors += 1
-                    async with lock: done_count += 1; d = done_count
+                    async with lock:
+                        if not started:
+                            started = True
+                        done_count += 1
+                        d = done_count
                     if d % 2 == 0 or d == len(lines):
+                        qi = ""
+                        a = global_queue.active
+                        if a >= global_queue.max and d < len(lines):
+                            qi = f"\n   🚦 Queue: `{a}/{global_queue.max}` slots active\n"
                         try:
                             await status.edit_text(
                                 f"{icon} *{esc(label)} — Running*\n{DIV}\n\n"
                                 f"   Done: `{d}/{len(lines)}` {item_w}\n   Found: `{len(results)}` URLs\n"
-                                f"   ⚡ Threads: `{PARSER_THREADS}`\n\n{pbar(d, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
+                                f"   ⚡ Threads: `{PARSER_THREADS}`{qi}\n\n{pbar(d, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
                                 parse_mode=ParseMode.MARKDOWN_V2)
                         except Exception: pass
                 await asyncio.gather(*[_pw(d) for d in lines], return_exceptions=True)
