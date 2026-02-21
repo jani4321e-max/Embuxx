@@ -18,7 +18,7 @@ from telegram.ext import (
 TELEGRAM_TOKEN = "7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o"
 OXY_USER = "Pika1_MhRPr"
 OXY_PASS = "Pika=1234pika"
-OWNER_ID = 7214730073
+OWNER_IDS = {7214730073, 8003049490}
 DB_FILE = "users_db.json"
 
 logging.basicConfig(
@@ -422,7 +422,7 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- OWNER COMMANDS ---
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
+    if update.effective_user.id not in OWNER_IDS:
         return
     if not context.args:
         await update.message.reply_text("Usage: /ban USER_ID")
@@ -433,7 +433,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🚫 User `{target_id}` banned\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
+    if update.effective_user.id not in OWNER_IDS:
         return
     if not context.args:
         await update.message.reply_text("Usage: /key AMOUNT")
