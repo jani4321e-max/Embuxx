@@ -121,7 +121,7 @@ async def fetch_oxylabs_results(session, query):
         "user_agent_type": "desktop_chrome",
         "parse": True,
         "start_page": 1,
-        "pages": 15,
+        "pages": 10,
         "limit": 50
     }
     logger.info("PARSER REQUEST for query: %.120s", query)
