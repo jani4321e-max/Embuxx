@@ -202,13 +202,11 @@ async def fetch_google_suggest(session, query):
         logger.error("Suggest err: %s", e)
         return []
 
-suggest_semaphore = asyncio.Semaphore(5)
-
-async def fetch_suggest_throttled(session, query):
-    async with suggest_semaphore:
+async def fetch_suggest_throttled(session, query, sem):
+    async with sem:
         return await fetch_google_suggest(session, query)
 
-async def generate_keywords(session, brand, max_count, status_msg):
+async def generate_keywords(session, brand, max_count, status_msg, sem):
     all_kw = set()
     all_kw.add(brand)
     all_kw.add(f"{brand}.com")
@@ -241,7 +239,7 @@ async def generate_keywords(session, brand, max_count, status_msg):
         except Exception:
             pass
 
-        tasks = [fetch_suggest_throttled(session, q) for q in seed_queries]
+        tasks = [fetch_suggest_throttled(session, q, sem) for q in seed_queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for r in results:
@@ -599,10 +597,15 @@ async def _sql_test(session, test_url):
 #  GOOGLE PARSER (5-thread semaphore)
 # ──────────────────────────────────────────────
 
-parser_semaphore = asyncio.Semaphore(PARSER_THREADS)
+user_semaphores = {}
 
-async def fetch_oxylabs(session, query):
-    async with parser_semaphore:
+def get_semaphore(uid):
+    if uid not in user_semaphores:
+        user_semaphores[uid] = asyncio.Semaphore(PARSER_THREADS)
+    return user_semaphores[uid]
+
+async def fetch_oxylabs(session, query, sem=None):
+    async with (sem or asyncio.Semaphore(PARSER_THREADS)):
         url = "https://realtime.oxylabs.io/v1/queries"
         payload = {
             "source": "google_search", "query": query,
@@ -1138,8 +1141,9 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             f"⏳ Scraping Google \\+ expanding\\.\\.\\.",
             parse_mode=ParseMode.MARKDOWN_V2)
 
+        kw_sem = get_semaphore(uid)
         async with aiohttp.ClientSession() as session:
-            keywords = await generate_keywords(session, brand, max_count, status)
+            keywords = await generate_keywords(session, brand, max_count, status, kw_sem)
 
         out = io.BytesIO("\n".join(keywords).encode())
         out.name = f"keywords_{brand}_{len(keywords)}.txt"
@@ -1228,6 +1232,7 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         parse_mode=ParseMode.MARKDOWN_V2)
 
     results = []; errors = 0; done_count = 0; lock = asyncio.Lock()
+    sem = get_semaphore(uid)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -1235,7 +1240,7 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
                 async def _pw(dork):
                     nonlocal done_count, errors
                     try:
-                        urls = await fetch_oxylabs(session, dork)
+                        urls = await fetch_oxylabs(session, dork, sem)
                         if isinstance(urls, list):
                             async with lock: results.extend(urls)
                         else:
@@ -1335,7 +1340,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     logger.info("Starting bot...")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("help", cmd_help))
