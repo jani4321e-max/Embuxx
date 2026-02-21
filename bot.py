@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import uuid
 import random
 import logging
@@ -8,6 +9,7 @@ import asyncio
 import traceback
 import aiohttp
 from datetime import datetime
+from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -78,6 +80,7 @@ def back_kb(target='back_menu'):
 
 def main_menu_kb():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔤  Keyword Maker", callback_data='mode_kw')],
         [InlineKeyboardButton("🛠  Dork Generator", callback_data='mode_gen')],
         [InlineKeyboardButton("🔎  Deep Parser", callback_data='mode_parse')],
         [InlineKeyboardButton("💉  SQL Tester", callback_data='mode_sql')],
@@ -97,7 +100,200 @@ def count_kb(prefix):
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("✏️  Custom Number", callback_data=f"{prefix}_custom")])
     return rows
+
+def extract_brand(site_input):
+    site_input = site_input.strip().lower()
+    if '/' in site_input or '.' in site_input:
+        if not site_input.startswith('http'):
+            site_input = 'https://' + site_input
+        try:
+            host = urlparse(site_input).hostname or site_input
+        except Exception:
+            host = site_input
+        parts = host.replace('www.', '').split('.')
+        return parts[0] if parts else site_input
+    return site_input
+
+# ──────────────────────────────────────────────
+#  KEYWORD MAKER — Google Suggest via Oxylabs
+# ──────────────────────────────────────────────
+
+KW_SUFFIXES = [
+    "login", "account", "password", "email", "database", "users",
+    "combo", "premium", "free", "cracked", "config", "checker",
+    "generator", "hack", "dump", "leak", "breach", "exploit",
+    "admin", "panel", "dashboard", "api", "key", "token",
+    "signup", "register", "reset", "forgot", "recovery",
+    "subscription", "membership", "plan", "trial", "coupon",
+    "gift card", "code", "voucher", "discount", "promo",
+    "order", "payment", "billing", "invoice", "receipt",
+    "customer", "support", "contact", "help", "faq",
+    "download", "upload", "file", "backup", "export",
+    "settings", "profile", "edit", "update", "delete",
+    "search", "filter", "sort", "list", "view",
+    "cart", "checkout", "shop", "store", "buy",
+    "mobile", "app", "desktop", "web", "online",
+    "error", "bug", "fix", "issue", "problem",
+    "sql", "injection", "vulnerability", "security", "bypass",
+    "proxy", "vpn", "ssh", "ftp", "smtp",
+]
+
+KW_PREFIXES = [
+    "free", "buy", "get", "how to", "best",
+    "cheap", "crack", "hack", "dump",
+]
+
+ALPHA = "abcdefghijklmnopqrstuvwxyz"
+
+async def fetch_google_suggest(session, query):
+    url = "https://realtime.oxylabs.io/v1/queries"
+    payload = {
+        "source": "google_search",
+        "query": query,
+        "user_agent_type": "desktop_chrome",
+        "parse": True,
+        "start_page": 1,
+        "pages": 1,
+        "limit": 10,
+    }
+    try:
+        async with session.post(
+            url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
+            json=payload, timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                return []
+            data = await r.json()
+            keywords = set()
+            for page in data.get("results", []):
+                content = page.get("content", {})
+                results = content.get("results", {})
+                organic = results.get("organic", [])
+                for item in organic:
+                    title = item.get("title", "")
+                    if title:
+                        keywords.add(title.lower().strip())
+                    desc = item.get("desc", "")
+                    if desc:
+                        words = re.findall(r'[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+){0,3}', desc.lower())
+                        for w in words[:5]:
+                            keywords.add(w.strip())
+                related = results.get("related_searches", {})
+                if isinstance(related, dict):
+                    for item in related.get("related_searches", []):
+                        q = item.get("query", "")
+                        if q:
+                            keywords.add(q.lower().strip())
+                elif isinstance(related, list):
+                    for item in related:
+                        q = item.get("query", "") if isinstance(item, dict) else str(item)
+                        if q:
+                            keywords.add(q.lower().strip())
+                paa = results.get("people_also_ask", [])
+                if isinstance(paa, list):
+                    for item in paa:
+                        q = item.get("question", "") if isinstance(item, dict) else str(item)
+                        if q:
+                            keywords.add(q.lower().strip())
+            return list(keywords)
+    except Exception as e:
+        logger.error("Suggest err: %s", e)
+        return []
+
+suggest_semaphore = asyncio.Semaphore(5)
+
+async def fetch_suggest_throttled(session, query):
+    async with suggest_semaphore:
+        return await fetch_google_suggest(session, query)
+
+async def generate_keywords(session, brand, max_count, status_msg):
+    all_kw = set()
+    all_kw.add(brand)
+    all_kw.add(f"{brand}.com")
+    all_kw.add(f"{brand} login")
+    all_kw.add(f"{brand} account")
+
+    for s in KW_SUFFIXES:
+        all_kw.add(f"{brand} {s}")
+    for p in KW_PREFIXES:
+        all_kw.add(f"{p} {brand}")
+    for letter in ALPHA:
+        all_kw.add(f"{brand} {letter}")
+
+    logger.info("KW: algorithmic generated %d base keywords for '%s'", len(all_kw), brand)
+
+    if len(all_kw) < max_count:
+        seed_queries = [brand]
+        for letter in ALPHA:
+            seed_queries.append(f"{brand} {letter}")
+        seed_queries = seed_queries[:27]
+
+        try:
+            await status_msg.edit_text(
+                f"🔤 *Keyword Maker — Scraping*\n{DIV}\n\n"
+                f"   Brand: `{esc(brand)}`\n"
+                f"   Base keywords: `{len(all_kw)}`\n"
+                f"   Scraping Google for more\\.\\.\\.\n\n"
+                f"{pbar(len(all_kw), max_count)}",
+                parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception:
+            pass
+
+        tasks = [fetch_suggest_throttled(session, q) for q in seed_queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in results:
+            if isinstance(r, list):
+                for kw in r:
+                    kw_clean = kw.strip().lower()
+                    if kw_clean and len(kw_clean) > 2:
+                        all_kw.add(kw_clean)
+
+        logger.info("KW: after scraping got %d keywords for '%s'", len(all_kw), brand)
+
+        try:
+            await status_msg.edit_text(
+                f"🔤 *Keyword Maker — Processing*\n{DIV}\n\n"
+                f"   Brand: `{esc(brand)}`\n"
+                f"   Scraped keywords: `{len(all_kw)}`\n"
+                f"   Expanding to `{max_count}`\\.\\.\\.\n\n"
+                f"{pbar(len(all_kw), max_count)}",
+                parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception:
+            pass
+
+    if len(all_kw) < max_count:
+        extra_suffixes = [
+            "2024", "2025", "2026", "new", "latest", "working",
+            "fresh", "valid", "real", "legit", "official",
+            "site", "website", "page", "portal", "link",
+            "data", "info", "details", "list", "collection",
+            "tool", "software", "script", "bot", "automation",
+            "test", "demo", "sample", "example", "tutorial",
+            "method", "trick", "tip", "guide", "manual",
+            "alternative", "similar", "like", "clone", "copy",
+            "pro", "plus", "ultra", "max", "lite",
+            "mod", "patch", "crack", "serial", "keygen",
+            "private", "public", "shared", "open", "closed",
+            "basic", "standard", "enterprise", "business", "personal",
+        ]
+        for s in extra_suffixes:
+            all_kw.add(f"{brand} {s}")
+            if len(all_kw) >= max_count * 2:
+                break
+        for s1 in KW_SUFFIXES[:20]:
+            for s2 in extra_suffixes[:10]:
+                all_kw.add(f"{brand} {s1} {s2}")
+                if len(all_kw) >= max_count * 2:
+                    break
+            if len(all_kw) >= max_count * 2:
+                break
+
+    kw_list = list(all_kw)
+    random.shuffle(kw_list)
+    return kw_list[:max_count]
 
 # ──────────────────────────────────────────────
 #  PRESET TEMPLATES
@@ -109,40 +305,23 @@ PRESET_COMBO = {
     "icon": "🎯",
     "desc": "SQLi dorks targeting login/user databases for combo dumping",
     "templates": [
-        'inurl:login.php?id= "{kw}"',
-        'inurl:member.php?id= "{kw}"',
-        'inurl:user.php?id= "{kw}"',
-        'inurl:profile.php?id= "{kw}"',
-        'inurl:account.php?id= "{kw}"',
-        'inurl:index.php?id= "{kw}"',
-        'inurl:view.php?id= "{kw}"',
-        'inurl:detail.php?id= "{kw}"',
-        'inurl:page.php?id= "{kw}"',
-        'inurl:show.php?id= "{kw}"',
-        'inurl:content.php?id= "{kw}"',
-        'inurl:info.php?id= "{kw}"',
-        'inurl:main.php?id= "{kw}"',
-        'inurl:default.php?id= "{kw}"',
-        'inurl:admin.php?id= "{kw}"',
-        'inurl:login.asp?id= "{kw}"',
-        'inurl:default.asp?id= "{kw}"',
-        'inurl:user.aspx?id= "{kw}"',
-        'inurl:users.php?id= "{kw}"',
-        'inurl:customer.php?id= "{kw}"',
-        'inurl:signup.php?id= "{kw}"',
-        'inurl:register.php?id= "{kw}"',
-        'inurl:auth.php?id= "{kw}"',
-        'inurl:accounts.php?id= "{kw}"',
-        'inurl:panel.php?id= "{kw}"',
-        'inurl:dashboard.php?id= "{kw}"',
-        'inurl:portal.php?id= "{kw}"',
-        'inurl:members.php?id= "{kw}"',
-        'inurl:subscriber.php?id= "{kw}"',
-        'inurl:manage.php?id= "{kw}"',
-        'inurl:.php?user_id= "{kw}"',
-        'inurl:.php?uid= "{kw}"',
-        'inurl:.php?member_id= "{kw}"',
-        'inurl:.php?account_id= "{kw}"',
+        'inurl:login.php?id= "{kw}"', 'inurl:member.php?id= "{kw}"',
+        'inurl:user.php?id= "{kw}"', 'inurl:profile.php?id= "{kw}"',
+        'inurl:account.php?id= "{kw}"', 'inurl:index.php?id= "{kw}"',
+        'inurl:view.php?id= "{kw}"', 'inurl:detail.php?id= "{kw}"',
+        'inurl:page.php?id= "{kw}"', 'inurl:show.php?id= "{kw}"',
+        'inurl:content.php?id= "{kw}"', 'inurl:info.php?id= "{kw}"',
+        'inurl:main.php?id= "{kw}"', 'inurl:default.php?id= "{kw}"',
+        'inurl:admin.php?id= "{kw}"', 'inurl:login.asp?id= "{kw}"',
+        'inurl:default.asp?id= "{kw}"', 'inurl:user.aspx?id= "{kw}"',
+        'inurl:users.php?id= "{kw}"', 'inurl:customer.php?id= "{kw}"',
+        'inurl:signup.php?id= "{kw}"', 'inurl:register.php?id= "{kw}"',
+        'inurl:auth.php?id= "{kw}"', 'inurl:accounts.php?id= "{kw}"',
+        'inurl:panel.php?id= "{kw}"', 'inurl:dashboard.php?id= "{kw}"',
+        'inurl:portal.php?id= "{kw}"', 'inurl:members.php?id= "{kw}"',
+        'inurl:subscriber.php?id= "{kw}"', 'inurl:manage.php?id= "{kw}"',
+        'inurl:.php?user_id= "{kw}"', 'inurl:.php?uid= "{kw}"',
+        'inurl:.php?member_id= "{kw}"', 'inurl:.php?account_id= "{kw}"',
         'inurl:.php?login_id= "{kw}"',
     ],
 }
@@ -153,40 +332,23 @@ PRESET_SHOPPING = {
     "icon": "🛒",
     "desc": "SQLi dorks targeting e-commerce sites for order/account dumping",
     "templates": [
-        'inurl:product.php?id= "{kw}"',
-        'inurl:item.php?id= "{kw}"',
-        'inurl:shop.php?id= "{kw}"',
-        'inurl:store.php?id= "{kw}"',
-        'inurl:buy.php?id= "{kw}"',
-        'inurl:cart.php?id= "{kw}"',
-        'inurl:order.php?id= "{kw}"',
-        'inurl:checkout.php?id= "{kw}"',
-        'inurl:catalog.php?id= "{kw}"',
-        'inurl:category.php?id= "{kw}"',
-        'inurl:products.php?cat= "{kw}"',
-        'inurl:goods.php?id= "{kw}"',
-        'inurl:productdetail.php?id= "{kw}"',
-        'inurl:product_detail.php?id= "{kw}"',
-        'inurl:product-detail.php?id= "{kw}"',
-        'inurl:view_product.php?id= "{kw}"',
-        'inurl:item_detail.php?id= "{kw}"',
-        'inurl:shopping.php?id= "{kw}"',
-        'inurl:basket.php?id= "{kw}"',
-        'inurl:invoice.php?id= "{kw}"',
-        'inurl:wishlist.php?id= "{kw}"',
-        'inurl:purchase.php?id= "{kw}"',
-        'inurl:listing.php?id= "{kw}"',
-        'inurl:offer.php?id= "{kw}"',
-        'inurl:deal.php?id= "{kw}"',
-        'inurl:price.php?id= "{kw}"',
-        'inurl:.php?product_id= "{kw}"',
-        'inurl:.php?item_id= "{kw}"',
-        'inurl:.php?cat_id= "{kw}"',
-        'inurl:.php?category_id= "{kw}"',
-        'inurl:.php?order_id= "{kw}"',
-        'inurl:.php?shop_id= "{kw}"',
-        'inurl:.php?pid= "{kw}"',
-        'inurl:.php?prod= "{kw}"',
+        'inurl:product.php?id= "{kw}"', 'inurl:item.php?id= "{kw}"',
+        'inurl:shop.php?id= "{kw}"', 'inurl:store.php?id= "{kw}"',
+        'inurl:buy.php?id= "{kw}"', 'inurl:cart.php?id= "{kw}"',
+        'inurl:order.php?id= "{kw}"', 'inurl:checkout.php?id= "{kw}"',
+        'inurl:catalog.php?id= "{kw}"', 'inurl:category.php?id= "{kw}"',
+        'inurl:products.php?cat= "{kw}"', 'inurl:goods.php?id= "{kw}"',
+        'inurl:productdetail.php?id= "{kw}"', 'inurl:product_detail.php?id= "{kw}"',
+        'inurl:product-detail.php?id= "{kw}"', 'inurl:view_product.php?id= "{kw}"',
+        'inurl:item_detail.php?id= "{kw}"', 'inurl:shopping.php?id= "{kw}"',
+        'inurl:basket.php?id= "{kw}"', 'inurl:invoice.php?id= "{kw}"',
+        'inurl:wishlist.php?id= "{kw}"', 'inurl:purchase.php?id= "{kw}"',
+        'inurl:listing.php?id= "{kw}"', 'inurl:offer.php?id= "{kw}"',
+        'inurl:deal.php?id= "{kw}"', 'inurl:price.php?id= "{kw}"',
+        'inurl:.php?product_id= "{kw}"', 'inurl:.php?item_id= "{kw}"',
+        'inurl:.php?cat_id= "{kw}"', 'inurl:.php?category_id= "{kw}"',
+        'inurl:.php?order_id= "{kw}"', 'inurl:.php?shop_id= "{kw}"',
+        'inurl:.php?pid= "{kw}"', 'inurl:.php?prod= "{kw}"',
         'inurl:.php?goods_id= "{kw}"',
     ],
 }
@@ -197,52 +359,31 @@ PRESET_CC = {
     "icon": "💳",
     "desc": "SQLi dorks targeting payment gateways & billing systems",
     "templates": [
-        'inurl:payment.php?id= "{kw}"',
-        'inurl:billing.php?id= "{kw}"',
-        'inurl:pay.php?id= "{kw}"',
-        'inurl:transaction.php?id= "{kw}"',
-        'inurl:checkout.php?id= "{kw}"',
-        'inurl:receipt.php?id= "{kw}"',
-        'inurl:donate.php?id= "{kw}"',
-        'inurl:subscription.php?id= "{kw}"',
-        'inurl:gateway.php?id= "{kw}"',
-        'inurl:process.php?id= "{kw}"',
-        'inurl:charge.php?id= "{kw}"',
-        'inurl:transfer.php?id= "{kw}"',
-        'inurl:wallet.php?id= "{kw}"',
-        'inurl:refund.php?id= "{kw}"',
-        'inurl:confirm.php?id= "{kw}"',
-        'inurl:paymentinfo.php?id= "{kw}"',
-        'inurl:payment_detail.php?id= "{kw}"',
-        'inurl:order_payment.php?id= "{kw}"',
-        'inurl:booking.php?id= "{kw}"',
-        'inurl:reserve.php?id= "{kw}"',
-        'inurl:plan.php?id= "{kw}"',
-        'inurl:invoice.php?id= "{kw}"',
-        'inurl:topup.php?id= "{kw}"',
-        'inurl:recharge.php?id= "{kw}"',
-        'inurl:deposit.php?id= "{kw}"',
-        'inurl:.php?payment_id= "{kw}"',
-        'inurl:.php?transaction_id= "{kw}"',
-        'inurl:.php?billing_id= "{kw}"',
-        'inurl:.php?invoice_id= "{kw}"',
-        'inurl:.php?receipt_id= "{kw}"',
-        'inurl:.php?booking_id= "{kw}"',
-        'inurl:.php?order_id= "{kw}"',
-        'inurl:.php?plan_id= "{kw}"',
-        'inurl:.php?sub_id= "{kw}"',
+        'inurl:payment.php?id= "{kw}"', 'inurl:billing.php?id= "{kw}"',
+        'inurl:pay.php?id= "{kw}"', 'inurl:transaction.php?id= "{kw}"',
+        'inurl:checkout.php?id= "{kw}"', 'inurl:receipt.php?id= "{kw}"',
+        'inurl:donate.php?id= "{kw}"', 'inurl:subscription.php?id= "{kw}"',
+        'inurl:gateway.php?id= "{kw}"', 'inurl:process.php?id= "{kw}"',
+        'inurl:charge.php?id= "{kw}"', 'inurl:transfer.php?id= "{kw}"',
+        'inurl:wallet.php?id= "{kw}"', 'inurl:refund.php?id= "{kw}"',
+        'inurl:confirm.php?id= "{kw}"', 'inurl:paymentinfo.php?id= "{kw}"',
+        'inurl:payment_detail.php?id= "{kw}"', 'inurl:order_payment.php?id= "{kw}"',
+        'inurl:booking.php?id= "{kw}"', 'inurl:reserve.php?id= "{kw}"',
+        'inurl:plan.php?id= "{kw}"', 'inurl:invoice.php?id= "{kw}"',
+        'inurl:topup.php?id= "{kw}"', 'inurl:recharge.php?id= "{kw}"',
+        'inurl:deposit.php?id= "{kw}"', 'inurl:.php?payment_id= "{kw}"',
+        'inurl:.php?transaction_id= "{kw}"', 'inurl:.php?billing_id= "{kw}"',
+        'inurl:.php?invoice_id= "{kw}"', 'inurl:.php?receipt_id= "{kw}"',
+        'inurl:.php?booking_id= "{kw}"', 'inurl:.php?order_id= "{kw}"',
+        'inurl:.php?plan_id= "{kw}"', 'inurl:.php?sub_id= "{kw}"',
         'inurl:.php?pay_id= "{kw}"',
     ],
 }
 
-PRESETS = {
-    "combo": PRESET_COMBO,
-    "shopping": PRESET_SHOPPING,
-    "cc": PRESET_CC,
-}
+PRESETS = {"combo": PRESET_COMBO, "shopping": PRESET_SHOPPING, "cc": PRESET_CC}
 
 # ──────────────────────────────────────────────
-#  CUSTOM BUILDER TEMPLATES (existing)
+#  CUSTOM BUILDER TEMPLATES
 # ──────────────────────────────────────────────
 
 DORK_CATEGORIES = {
@@ -332,43 +473,28 @@ SITE_TYPES = {
 }
 
 PAGE_PARAMS = {
-    "inurl": {
-        "label": "URL Parameters", "icon": "🔗",
-        "extra": [
-            'inurl:php?id= "{kw}"', 'inurl:asp?id= "{kw}"',
-            'inurl:page= "{kw}"', 'inurl:cat= "{kw}"',
-            'inurl:item= "{kw}"', 'inurl:view= "{kw}"',
-            'inurl:product= "{kw}"', 'inurl:file= "{kw}"',
-            'inurl:download= "{kw}"', 'inurl:action= "{kw}"',
-        ],
-    },
-    "filetype": {
-        "label": "File Types", "icon": "📎",
-        "extra": [
-            'filetype:pdf "{kw}"', 'filetype:doc "{kw}"',
-            'filetype:docx "{kw}"', 'filetype:ppt "{kw}"',
-            'filetype:xlsx "{kw}"', 'filetype:xml "{kw}"',
-            'filetype:json "{kw}"', 'filetype:txt "{kw}"',
-        ],
-    },
-    "intitle": {
-        "label": "Page Titles", "icon": "📰",
-        "extra": [
-            'intitle:"{kw}"', 'intitle:"{kw}" "admin"',
-            'intitle:"{kw}" "login"', 'intitle:"{kw}" "dashboard"',
-            'intitle:"{kw}" "config"', 'intitle:"{kw}" "error"',
-            'allintitle:"{kw}" password',
-        ],
-    },
-    "intext": {
-        "label": "Page Content", "icon": "📝",
-        "extra": [
-            'intext:"{kw}"', 'intext:"{kw}" "password"',
-            'intext:"{kw}" "username"', 'intext:"{kw}" "secret"',
-            'allintext:"{kw}" "confidential"', 'allintext:"{kw}" "internal"',
-        ],
-    },
-    "none": {"label": "No Extra Params", "icon": "➖", "extra": []},
+    "inurl":    {"label": "URL Parameters", "icon": "🔗", "extra": [
+        'inurl:php?id= "{kw}"', 'inurl:asp?id= "{kw}"', 'inurl:page= "{kw}"',
+        'inurl:cat= "{kw}"', 'inurl:item= "{kw}"', 'inurl:view= "{kw}"',
+        'inurl:product= "{kw}"', 'inurl:file= "{kw}"', 'inurl:download= "{kw}"',
+        'inurl:action= "{kw}"',
+    ]},
+    "filetype": {"label": "File Types", "icon": "📎", "extra": [
+        'filetype:pdf "{kw}"', 'filetype:doc "{kw}"', 'filetype:docx "{kw}"',
+        'filetype:ppt "{kw}"', 'filetype:xlsx "{kw}"', 'filetype:xml "{kw}"',
+        'filetype:json "{kw}"', 'filetype:txt "{kw}"',
+    ]},
+    "intitle":  {"label": "Page Titles", "icon": "📰", "extra": [
+        'intitle:"{kw}"', 'intitle:"{kw}" "admin"', 'intitle:"{kw}" "login"',
+        'intitle:"{kw}" "dashboard"', 'intitle:"{kw}" "config"',
+        'intitle:"{kw}" "error"', 'allintitle:"{kw}" password',
+    ]},
+    "intext":   {"label": "Page Content", "icon": "📝", "extra": [
+        'intext:"{kw}"', 'intext:"{kw}" "password"', 'intext:"{kw}" "username"',
+        'intext:"{kw}" "secret"', 'allintext:"{kw}" "confidential"',
+        'allintext:"{kw}" "internal"',
+    ]},
+    "none":     {"label": "No Extra Params", "icon": "➖", "extra": []},
 }
 
 # ──────────────────────────────────────────────
@@ -532,34 +658,29 @@ WELCOME = (
     "🌐 *Aleph Null — Sovereign Engine*\n"
     f"{DIV}\n\n"
     "Welcome\\! Pick a module to get started\\.\n\n"
-    "📌 *Quick Start:*\n"
-    "  1️⃣  Choose a mode\n"
-    "  2️⃣  Follow the steps\n"
-    "  3️⃣  Get your results\\!\n\n"
+    "📌 *Full Pipeline:*\n"
+    "  1️⃣  🔤 Keyword Maker \\→ generate keywords\n"
+    "  2️⃣  🛠 Dork Generator \\→ build dorks\n"
+    "  3️⃣  🔎 Deep Parser \\→ get real URLs\n"
+    "  4️⃣  💉 SQL Tester \\→ find vulns\n\n"
     f"{DIV}"
 )
 
 HELP = (
     "❓ *How to Use This Bot*\n"
     f"{DIV}\n\n"
-    "🛠 *Dork Generator*\n"
-    "  Two ways to generate:\n\n"
-    "  *Quick Presets* \\(1\\-click setup\\):\n"
-    "  🎯 Site Targeted Combo\n"
-    "  🛒 Shopping Combos\n"
-    "  💳 CC Dumps\n"
-    "  → Just pick preset, set count, send keywords\\!\n\n"
-    "  *Custom Builder* \\(full control\\):\n"
-    "  ① Pick Dork Type\n"
-    "  ② Pick Site Scope\n"
-    "  ③ Pick Page Params\n"
-    "  ④ Set count, send keywords\n\n"
+    "🔤 *Keyword Maker*  \\(FREE\\)\n"
+    "  Give a site \\(e\\.g\\. `netflix.com`\\)\n"
+    "  Bot scrapes Google \\+ expands to UHQ keywords\\.\n"
+    "  Set any custom count \\(50\\-5000\\)\\.\n\n"
+    "🛠 *Dork Generator*  \\(FREE\\)\n"
+    "  3 presets \\(Combo, Shopping, CC SQLi\\)\n"
+    "  \\+ Custom Builder with full control\\.\n"
+    "  Set any custom count\\.\n\n"
     "🔎 *Deep Parser*  \\(5 credits/dork\\)\n"
-    "  Scrapes Google with 5 concurrent threads\\.\n"
-    "  → Send dorks as text or \\.txt file\\.\n\n"
+    "  Scrapes Google with 5 threads\\.\n\n"
     "💉 *SQL Tester*  \\(5 credits/URL\\)\n"
-    "  Tests URLs for SQL injection\\.\n"
-    "  → Send URLs as text or \\.txt file\\.\n\n"
+    "  Tests URLs for SQL injection\\.\n\n"
     f"{DIV}\n"
     "📝 *Commands:*\n"
     "  /start — Main menu\n"
@@ -650,12 +771,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
 
-    # ── Navigation ──
     if data == 'back_menu':
         user_states.pop(uid, None)
         await q.edit_message_text(WELCOME, reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN_V2)
         return
-
+    if data == '_noop':
+        return
     if data == 'show_balance':
         ud = get_user(uid)
         text = (
@@ -666,9 +787,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
         return
-
     if data == 'show_help':
         await q.edit_message_text(HELP, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
+        return
+
+    # ══════════════════════════════════════════
+    #  KEYWORD MAKER
+    # ══════════════════════════════════════════
+    if data == 'mode_kw':
+        user_states[uid] = {"mode": "KEYWORD", "step": "count"}
+        rows = count_kb("kwcount")
+        rows.append([InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')])
+        text = (
+            f"🔤 *Keyword Maker*\n{DIV}\n\n"
+            f"Generates UHQ keywords from any site name\\.\n"
+            f"Scrapes Google \\+ algorithmic expansion\\.\n\n"
+            f"📊 *How many keywords* to generate?\n\n"
+            f"Pick a preset or type a custom number\\.\n\n"
+            f"🆓 This is *free* — no credits needed\\!"
+        )
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    if data.startswith('kwcount_'):
+        val = data.replace('kwcount_', '')
+        if val == 'custom':
+            st = user_states.get(uid, {})
+            st.update({"step": "custom_count"})
+            user_states[uid] = st
+            bk = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')],
+            ])
+            await q.edit_message_text(
+                f"🔤 *Keyword Maker — Custom Count*\n{DIV}\n\n"
+                f"Type a number below \\(e\\.g\\. `1500`\\):\n",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
+            return
+        max_count = int(val)
+        st = user_states.get(uid, {})
+        st.update({"step": "site_input", "max_count": max_count})
+        user_states[uid] = st
+        bk = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️  Change Count", callback_data='mode_kw')],
+        ])
+        await q.edit_message_text(
+            f"🔤 *Keyword Maker — Enter Site*\n{DIV}\n\n"
+            f"   Keywords to generate: `{max_count}`\n\n"
+            f"✏️ Now send me a *site name or URL*\n\n"
+            f"💡 _Examples:_\n"
+            f"`netflix.com`\n`spotify`\n`amazon.com`\n",
+            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
 
     # ── Mode: Parser ──
@@ -712,14 +880,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ══════════════════════════════════════════
-    #  GENERATOR — MAIN MENU (presets + custom)
+    #  DORK GENERATOR MENU
     # ══════════════════════════════════════════
     if data == 'mode_gen':
         user_states[uid] = {"mode": "GENERATOR", "step": "choose_type"}
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎯  Site Targeted Combo", callback_data='preset_combo')],
-            [InlineKeyboardButton("🛒  Shopping Combos", callback_data='preset_shopping')],
-            [InlineKeyboardButton("💳  CC Dumps", callback_data='preset_cc')],
+            [InlineKeyboardButton("🛒  Shopping SQLi", callback_data='preset_shopping')],
+            [InlineKeyboardButton("💳  CC / Payment SQLi", callback_data='preset_cc')],
             [InlineKeyboardButton(f"{DIV}", callback_data='_noop')],
             [InlineKeyboardButton("🛠  Custom Builder", callback_data='custom_start')],
             [InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')],
@@ -740,17 +908,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    if data == '_noop':
-        return
-
-    # ══════════════════════════════════════════
-    #  PRESETS — pick count
-    # ══════════════════════════════════════════
+    # ── Presets — pick count ──
     if data.startswith('preset_'):
         preset_key = data.replace('preset_', '')
         preset = PRESETS.get(preset_key)
-        if not preset:
-            return
+        if not preset: return
         user_states[uid] = {
             "mode": "GENERATOR", "step": "preset_count",
             "gen_type": "preset", "preset": preset_key,
@@ -760,20 +922,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"{preset['icon']} *{esc(preset['label'])}*\n{DIV}\n\n"
             f"_{esc(preset['desc'])}_\n\n"
-            f"⚙️ *Auto\\-configured settings:*\n"
-            f"   Templates: `{len(preset['templates'])}` patterns\n"
-            f"   Site scope: 🌐 Any\n"
-            f"   Parameters: auto\n\n"
-            f"📊 *How many dorks* do you want to generate?\n"
+            f"⚙️ *Auto\\-configured:*\n"
+            f"   Templates: `{len(preset['templates'])}` patterns\n\n"
+            f"📊 *How many dorks* to generate?\n"
         )
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # ── Preset — count selected → ask keywords ──
+    # ── Preset count → custom or value ──
     if data.startswith('pcount_'):
         parts = data.split('_')
         preset_key = parts[1]
-        max_count = int(parts[2])
+        val = parts[2]
+        if val == 'custom':
+            st = user_states.get(uid, {})
+            st.update({"step": "custom_count", "count_next": "preset_keywords"})
+            user_states[uid] = st
+            bk = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️  Back", callback_data=f"preset_{preset_key}")],
+            ])
+            await q.edit_message_text(
+                f"🛠 *Custom Count*\n{DIV}\n\nType a number below \\(e\\.g\\. `2000`\\):\n",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
+            return
+        max_count = int(val)
         preset = PRESETS.get(preset_key, {})
         st = user_states.get(uid, {})
         st.update({"step": "keywords", "max_count": max_count})
@@ -788,87 +960,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Max dorks: `{max_count}`\n\n"
             f"✏️ Now send me your *keywords*\n"
             f"\\(one per line, or upload a \\.txt file\\)\n\n"
-            f"💡 _Example — just type:_\n"
-            f"`netflix`\n`spotify`\n`amazon`\n\n"
-            f"🆓 This is *free* — no credits needed\\!"
+            f"🆓 *Free* — no credits needed\\!"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
 
     # ══════════════════════════════════════════
-    #  CUSTOM BUILDER — Step 1: Dork Type
+    #  CUSTOM BUILDER
     # ══════════════════════════════════════════
     if data == 'custom_start':
         user_states[uid] = {"mode": "GENERATOR", "step": "cust_dtype", "gen_type": "custom"}
         rows = []
         for key, cat in DORK_CATEGORIES.items():
-            rows.append([InlineKeyboardButton(
-                f"{cat['icon']}  {cat['label']}", callback_data=f"cdtype_{key}"
-            )])
+            rows.append([InlineKeyboardButton(f"{cat['icon']}  {cat['label']}", callback_data=f"cdtype_{key}")])
         rows.append([InlineKeyboardButton("⬅️  Back", callback_data='mode_gen')])
-        text = (
-            f"🛠 *Custom Builder — Step 1/4*\n{DIV}\n\n"
-            f"Choose the *type of dorks*:\n"
-        )
+        text = f"🛠 *Custom Builder — Step 1/4*\n{DIV}\n\nChoose the *type of dorks*:\n"
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # ── Custom Step 2: Site Type ──
     if data.startswith("cdtype_"):
         dtype = data.replace("cdtype_", "")
-        st = user_states.get(uid, {})
-        st.update({"step": "cust_site", "dork_type": dtype})
-        user_states[uid] = st
+        st = user_states.get(uid, {}); st.update({"step": "cust_site", "dork_type": dtype}); user_states[uid] = st
         cat = DORK_CATEGORIES.get(dtype, {})
         rows = []
         for key, site in SITE_TYPES.items():
-            rows.append([InlineKeyboardButton(
-                f"{site['icon']}  {site['label']}", callback_data=f"csite_{key}"
-            )])
+            rows.append([InlineKeyboardButton(f"{site['icon']}  {site['label']}", callback_data=f"csite_{key}")])
         rows.append([InlineKeyboardButton("⬅️  Back", callback_data='custom_start')])
         text = (
             f"🛠 *Custom Builder — Step 2/4*\n{DIV}\n\n"
-            f"   Dork type: {cat.get('icon','')} *{esc(cat.get('label',''))}*\n\n"
-            f"Choose the *site scope*:\n"
+            f"   Dork type: {cat.get('icon','')} *{esc(cat.get('label',''))}*\n\nChoose *site scope*:\n"
         )
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # ── Custom Step 3: Page Params ──
     if data.startswith("csite_"):
         stype = data.replace("csite_", "")
-        st = user_states.get(uid, {})
-        st.update({"step": "cust_param", "site_type": stype})
-        user_states[uid] = st
-        dtype = st.get("dork_type", "all")
-        cat = DORK_CATEGORIES.get(dtype, {})
-        site = SITE_TYPES.get(stype, {})
+        st = user_states.get(uid, {}); st.update({"step": "cust_param", "site_type": stype}); user_states[uid] = st
+        dtype = st.get("dork_type", "all"); cat = DORK_CATEGORIES.get(dtype, {}); site = SITE_TYPES.get(stype, {})
         rows = []
         for key, pp in PAGE_PARAMS.items():
-            rows.append([InlineKeyboardButton(
-                f"{pp['icon']}  {pp['label']}", callback_data=f"cparam_{key}"
-            )])
+            rows.append([InlineKeyboardButton(f"{pp['icon']}  {pp['label']}", callback_data=f"cparam_{key}")])
         rows.append([InlineKeyboardButton("⬅️  Back", callback_data=f"cdtype_{dtype}")])
         text = (
             f"🛠 *Custom Builder — Step 3/4*\n{DIV}\n\n"
             f"   Dork type: {cat.get('icon','')} *{esc(cat.get('label',''))}*\n"
-            f"   Site scope: {site.get('icon','')} *{esc(site.get('label',''))}*\n\n"
-            f"Choose *page parameters*:\n"
+            f"   Site scope: {site.get('icon','')} *{esc(site.get('label',''))}*\n\nChoose *parameters*:\n"
         )
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # ── Custom Step 4: Count ──
     if data.startswith("cparam_"):
         pparam = data.replace("cparam_", "")
-        st = user_states.get(uid, {})
-        st.update({"step": "cust_count", "page_param": pparam})
-        user_states[uid] = st
-        dtype = st.get("dork_type", "all")
-        stype = st.get("site_type", "any")
-        cat = DORK_CATEGORIES.get(dtype, {})
-        site = SITE_TYPES.get(stype, {})
-        pp = PAGE_PARAMS.get(pparam, {})
+        st = user_states.get(uid, {}); st.update({"step": "cust_count", "page_param": pparam}); user_states[uid] = st
+        dtype = st.get("dork_type", "all"); stype = st.get("site_type", "any")
+        cat = DORK_CATEGORIES.get(dtype, {}); site = SITE_TYPES.get(stype, {}); pp = PAGE_PARAMS.get(pparam, {})
         rows = count_kb("ccount")
         rows.append([InlineKeyboardButton("⬅️  Back", callback_data=f"csite_{stype}")])
         text = (
@@ -881,18 +1026,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # ── Custom — count selected → ask keywords ──
     if data.startswith("ccount_"):
-        max_count = int(data.replace("ccount_", ""))
+        val = data.replace("ccount_", "")
         st = user_states.get(uid, {})
-        st.update({"step": "keywords", "max_count": max_count})
-        user_states[uid] = st
-        dtype = st.get("dork_type", "all")
-        stype = st.get("site_type", "any")
-        pparam = st.get("page_param", "none")
-        cat = DORK_CATEGORIES.get(dtype, {})
-        site = SITE_TYPES.get(stype, {})
-        pp = PAGE_PARAMS.get(pparam, {})
+        if val == 'custom':
+            st.update({"step": "custom_count", "count_next": "custom_keywords"}); user_states[uid] = st
+            pparam = st.get("page_param", "none")
+            bk = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️  Back", callback_data=f"cparam_{pparam}")]])
+            await q.edit_message_text(
+                f"🛠 *Custom Count*\n{DIV}\n\nType a number below \\(e\\.g\\. `2000`\\):\n",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
+            return
+        max_count = int(val)
+        st.update({"step": "keywords", "max_count": max_count}); user_states[uid] = st
+        dtype = st.get("dork_type", "all"); stype = st.get("site_type", "any"); pparam = st.get("page_param", "none")
+        cat = DORK_CATEGORIES.get(dtype, {}); site = SITE_TYPES.get(stype, {}); pp = PAGE_PARAMS.get(pparam, {})
         bk = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅️  Change Count", callback_data=f"cparam_{pparam}")],
             [InlineKeyboardButton("⬅️  Start Over", callback_data='mode_gen')],
@@ -903,11 +1051,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Site scope: {site.get('icon','')} *{esc(site.get('label',''))}*\n"
             f"   Parameters: {pp.get('icon','')} *{esc(pp.get('label',''))}*\n"
             f"   Max dorks: `{max_count}`\n\n"
-            f"✏️ Now send me your *keywords*\n"
-            f"\\(one per line, or upload a \\.txt file\\)\n\n"
-            f"💡 _Example — just type:_\n"
-            f"`admin`\n`password`\n`config`\n\n"
-            f"🆓 This is *free* — no credits needed\\!"
+            f"✏️ Send *keywords* \\(text or \\.txt file\\)\n\n"
+            f"🆓 *Free* — no credits needed\\!"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
@@ -921,7 +1066,8 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
     uid_s = str(uid)
     st = user_states.get(uid, {})
     mode = st.get("mode")
-    logger.info("process: user=%s mode=%s items=%d", uid_s, mode, len(lines))
+    step = st.get("step")
+    logger.info("process: user=%s mode=%s step=%s items=%d", uid_s, mode, step, len(lines))
 
     if not mode:
         await update.message.reply_text(
@@ -929,13 +1075,97 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             parse_mode=ParseMode.MARKDOWN_V2)
         return
 
+    # ── CUSTOM COUNT INPUT ──
+    if step == "custom_count":
+        raw = lines[0].strip()
+        try:
+            num = int(raw)
+            if num < 1 or num > 50000:
+                await update.message.reply_text("⚠️ Number must be between 1 and 50000\\.", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+        except ValueError:
+            await update.message.reply_text("⚠️ Please send a *valid number*\\.", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        count_next = st.get("count_next", "")
+        st["max_count"] = num
+
+        if mode == "KEYWORD":
+            st["step"] = "site_input"
+            user_states[uid] = st
+            await update.message.reply_text(
+                f"🔤 *Keyword Maker — Enter Site*\n{DIV}\n\n"
+                f"   Keywords to generate: `{num}`\n\n"
+                f"✏️ Send me a *site name or URL*\n\n"
+                f"💡 _Examples:_ `netflix.com`, `spotify`, `amazon`\n",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        if count_next == "preset_keywords":
+            st["step"] = "keywords"
+            user_states[uid] = st
+            preset_key = st.get("preset", "combo")
+            preset = PRESETS.get(preset_key, {})
+            await update.message.reply_text(
+                f"{preset.get('icon','')} *{esc(preset.get('label',''))}*\n{DIV}\n\n"
+                f"   Max dorks: `{num}`\n\n"
+                f"✏️ Send *keywords* \\(text or \\.txt file\\)\n",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        if count_next == "custom_keywords":
+            st["step"] = "keywords"
+            user_states[uid] = st
+            await update.message.reply_text(
+                f"🛠 *Custom Builder*\n{DIV}\n\n"
+                f"   Max dorks: `{num}`\n\n"
+                f"✏️ Send *keywords* \\(text or \\.txt file\\)\n",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        return
+
+    # ── KEYWORD MAKER — site input ──
+    if mode == "KEYWORD" and step == "site_input":
+        site_raw = lines[0].strip()
+        brand = extract_brand(site_raw)
+        max_count = st.get("max_count", 500)
+        logger.info("KW: brand='%s' max=%d", brand, max_count)
+
+        status = await update.message.reply_text(
+            f"🔤 *Keyword Maker — Starting*\n{DIV}\n\n"
+            f"   Site: `{esc(brand)}`\n"
+            f"   Target: `{max_count}` keywords\n\n{pbar(0, 1)}\n\n"
+            f"⏳ Scraping Google \\+ expanding\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        async with aiohttp.ClientSession() as session:
+            keywords = await generate_keywords(session, brand, max_count, status)
+
+        out = io.BytesIO("\n".join(keywords).encode())
+        out.name = f"keywords_{brand}_{len(keywords)}.txt"
+
+        ud = get_user(uid_s)
+        ud["uses"] = ud.get("uses", 0) + 1
+        db[uid_s] = ud; save_db(db)
+
+        await status.edit_text(
+            f"✅ *Keywords Generated\\!*\n{DIV}\n\n"
+            f"   Site: `{esc(brand)}`\n"
+            f"   Generated: `{len(keywords)}`\n"
+            f"   Requested: `{max_count}`\n\n{pbar(1, 1)}\n\n"
+            f"📄 File attached below ⬇️",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        await update.message.reply_document(
+            document=out,
+            caption=f"🔤 {len(keywords)} UHQ keywords for {brand}")
+        return
+
     # ── GENERATOR ──
     if mode == "GENERATOR":
-        step = st.get("step")
         if step != "keywords":
             await update.message.reply_text(
-                "⚠️ *Please complete the setup first\\!*\n\n"
-                "Use the buttons above to finish configuration\\.",
+                "⚠️ *Please complete the setup first\\!*\n\nUse the buttons above\\.",
                 parse_mode=ParseMode.MARKDOWN_V2)
             return
 
@@ -945,184 +1175,124 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         if gen_type == "preset":
             preset_key = st.get("preset", "combo")
             preset = PRESETS.get(preset_key, {})
-            label = preset.get("label", "Preset")
-            icon = preset.get("icon", "🛠")
-
+            label = preset.get("label", "Preset"); icon = preset.get("icon", "🛠")
             status = await update.message.reply_text(
                 f"{icon} *Generating {esc(label)}\\.\\.\\.*\n{DIV}\n\n"
-                f"   Keywords: `{len(lines)}`\n"
-                f"   Max dorks: `{max_count}`\n\n{pbar(0, 1)}",
+                f"   Keywords: `{len(lines)}`\n   Max dorks: `{max_count}`\n\n{pbar(0, 1)}",
                 parse_mode=ParseMode.MARKDOWN_V2)
-
             dorks = build_preset_dorks(lines, preset_key, max_count)
-
         else:
-            dtype = st.get("dork_type", "all")
-            stype = st.get("site_type", "any")
-            pparam = st.get("page_param", "none")
-            cat = DORK_CATEGORIES.get(dtype, {})
-            site = SITE_TYPES.get(stype, {})
-            pp = PAGE_PARAMS.get(pparam, {})
-            icon = "🛠"
-            label = "Custom Dorks"
-
+            dtype = st.get("dork_type", "all"); stype = st.get("site_type", "any"); pparam = st.get("page_param", "none")
+            cat = DORK_CATEGORIES.get(dtype, {}); site = SITE_TYPES.get(stype, {}); pp = PAGE_PARAMS.get(pparam, {})
+            icon = "🛠"; label = "Custom Dorks"
             status = await update.message.reply_text(
-                f"🛠 *Generating Custom Dorks\\.\\.\\.*\n{DIV}\n\n"
+                f"🛠 *Generating\\.\\.\\.*\n{DIV}\n\n"
                 f"   Type: {cat.get('icon','')} {esc(cat.get('label',''))}\n"
                 f"   Scope: {site.get('icon','')} {esc(site.get('label',''))}\n"
-                f"   Params: {pp.get('icon','')} {esc(pp.get('label',''))}\n"
-                f"   Keywords: `{len(lines)}`\n"
-                f"   Max dorks: `{max_count}`\n\n{pbar(0, 1)}",
+                f"   Keywords: `{len(lines)}` | Max: `{max_count}`\n\n{pbar(0, 1)}",
                 parse_mode=ParseMode.MARKDOWN_V2)
-
             dorks = build_custom_dorks(lines, dtype, stype, pparam, max_count)
 
         out = io.BytesIO("\n".join(dorks).encode())
         out.name = f"dorks_{gen_type}_{len(dorks)}.txt"
-
-        ud = get_user(uid_s)
-        ud["uses"] = ud.get("uses", 0) + 1
-        db[uid_s] = ud; save_db(db)
+        ud = get_user(uid_s); ud["uses"] = ud.get("uses", 0) + 1; db[uid_s] = ud; save_db(db)
 
         await status.edit_text(
             f"✅ *{esc(label)} — Done\\!*\n{DIV}\n\n"
-            f"   Keywords: `{len(lines)}`\n"
-            f"   Dorks generated: `{len(dorks)}`\n"
-            f"   Limit: `{max_count}`\n\n{pbar(1, 1)}\n\n"
-            f"📄 File attached below ⬇️",
+            f"   Keywords: `{len(lines)}`\n   Dorks: `{len(dorks)}`\n   Limit: `{max_count}`\n\n"
+            f"{pbar(1, 1)}\n\n📄 File below ⬇️",
             parse_mode=ParseMode.MARKDOWN_V2)
-
-        await update.message.reply_document(
-            document=out,
-            caption=f"{icon} {len(dorks)} dorks from {len(lines)} keywords")
+        await update.message.reply_document(document=out, caption=f"{icon} {len(dorks)} dorks from {len(lines)} keywords")
         return
 
     # ── PARSER / SQL ──
     cost = len(lines) * 5
-    ud = get_user(uid_s)
-    credits = ud.get("credits", 0)
-
+    ud = get_user(uid_s); credits = ud.get("credits", 0)
     if credits < cost:
         await update.message.reply_text(
             f"❌ *Not Enough Credits*\n{DIV}\n\n"
-            f"   Required: `{cost}` \\({len(lines)} × 5\\)\n"
-            f"   Balance: `{credits}`\n\n"
-            f"Use /redeem `KEY` to add more\\.",
-            parse_mode=ParseMode.MARKDOWN_V2)
+            f"   Required: `{cost}` \\({len(lines)} × 5\\)\n   Balance: `{credits}`\n\n"
+            f"Use /redeem `KEY` to add more\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     is_parser = mode == "PARSER"
     icon = "🔎" if is_parser else "💉"
     label = "Deep Parser" if is_parser else "SQL Tester"
     item_w = "dorks" if is_parser else "URLs"
-    thread_info = f"\n   ⚡ Threads: `{PARSER_THREADS}` concurrent\n" if is_parser else "\n"
+    thread_info = f"\n   ⚡ Threads: `{PARSER_THREADS}`\n" if is_parser else "\n"
 
     status = await update.message.reply_text(
         f"{icon} *{esc(label)} — Running*\n{DIV}\n\n"
-        f"   Items: `{len(lines)}` {item_w}\n"
-        f"   Cost: `{cost}` credits{thread_info}\n"
+        f"   Items: `{len(lines)}` {item_w}\n   Cost: `{cost}` credits{thread_info}\n"
         f"{pbar(0, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
         parse_mode=ParseMode.MARKDOWN_V2)
 
-    results = []
-    errors = 0
-    done_count = 0
-    lock = asyncio.Lock()
+    results = []; errors = 0; done_count = 0; lock = asyncio.Lock()
 
     try:
         async with aiohttp.ClientSession() as session:
             if is_parser:
-                async def _parse_worker(dork):
+                async def _pw(dork):
                     nonlocal done_count, errors
                     try:
                         urls = await fetch_oxylabs(session, dork)
                         if isinstance(urls, list):
-                            async with lock:
-                                results.extend(urls)
+                            async with lock: results.extend(urls)
                         else:
-                            async with lock:
-                                errors += 1
+                            async with lock: errors += 1
                     except Exception as e:
-                        logger.error("Parser worker err: %s", e)
-                        async with lock:
-                            errors += 1
-                    async with lock:
-                        done_count += 1
-                        d = done_count
+                        logger.error("PW err: %s", e)
+                        async with lock: errors += 1
+                    async with lock: done_count += 1; d = done_count
                     if d % 2 == 0 or d == len(lines):
                         try:
                             await status.edit_text(
                                 f"{icon} *{esc(label)} — Running*\n{DIV}\n\n"
-                                f"   Processed: `{d}/{len(lines)}` {item_w}\n"
-                                f"   Found: `{len(results)}` URLs\n"
-                                f"   ⚡ Threads: `{PARSER_THREADS}`\n\n"
-                                f"{pbar(d, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
+                                f"   Done: `{d}/{len(lines)}` {item_w}\n   Found: `{len(results)}` URLs\n"
+                                f"   ⚡ Threads: `{PARSER_THREADS}`\n\n{pbar(d, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
                                 parse_mode=ParseMode.MARKDOWN_V2)
-                        except Exception:
-                            pass
-
-                tasks = [_parse_worker(d) for d in lines]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                        except Exception: pass
+                await asyncio.gather(*[_pw(d) for d in lines], return_exceptions=True)
             else:
-                batch_size = 5
-                for i in range(0, len(lines), batch_size):
-                    chunk = lines[i:i + batch_size]
-                    batch = await asyncio.gather(
-                        *(check_sql(session, url) for url in chunk),
-                        return_exceptions=True)
+                for i in range(0, len(lines), 5):
+                    chunk = lines[i:i+5]
+                    batch = await asyncio.gather(*(check_sql(session, u) for u in chunk), return_exceptions=True)
                     for r in batch:
-                        if isinstance(r, Exception):
-                            errors += 1
-                        elif r:
-                            results.append(r)
-                    done_count = min(i + batch_size, len(lines))
+                        if isinstance(r, Exception): errors += 1
+                        elif r: results.append(r)
+                    done_count = min(i+5, len(lines))
                     try:
                         await status.edit_text(
                             f"{icon} *{esc(label)} — Running*\n{DIV}\n\n"
-                            f"   Scanned: `{done_count}/{len(lines)}` URLs\n"
-                            f"   Vulns found: `{len(results)}`\n\n"
+                            f"   Scanned: `{done_count}/{len(lines)}` URLs\n   Vulns: `{len(results)}`\n\n"
                             f"{pbar(done_count, len(lines))}\n\n⏳ Please wait\\.\\.\\.",
                             parse_mode=ParseMode.MARKDOWN_V2)
-                    except Exception:
-                        pass
-
+                    except Exception: pass
     except Exception as e:
         logger.error("Session err: %s\n%s", e, traceback.format_exc())
-        await status.edit_text(
-            f"❌ *Error*\n{DIV}\n\n   `{esc(str(e))}`\n\nCredits were *not* deducted\\.",
-            parse_mode=ParseMode.MARKDOWN_V2)
+        await status.edit_text(f"❌ *Error*\n{DIV}\n\n`{esc(str(e))}`\n\nCredits *not* deducted\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    ud["credits"] -= cost
-    ud["uses"] = ud.get("uses", 0) + 1
-    db[uid_s] = ud; save_db(db)
-
+    ud["credits"] -= cost; ud["uses"] = ud.get("uses", 0) + 1; db[uid_s] = ud; save_db(db)
     final = list(set(results))
     logger.info("%s done: user=%s raw=%d unique=%d credits=%d", mode, uid_s, len(results), len(final), ud["credits"])
-
     err_note = f"\n   ⚠️ Errors: `{errors}`\n" if errors else ""
 
     if not final:
         rw = "results" if is_parser else "vulnerabilities"
         await status.edit_text(
             f"{icon} *{esc(label)} — Complete*\n{DIV}\n\n"
-            f"   Scanned: `{len(lines)}` {item_w}\n"
-            f"   {esc(rw.title())}: `0`{err_note}\n\n"
-            f"{pbar(1, 1)}\n\n💰 Remaining: `{ud['credits']}`",
-            parse_mode=ParseMode.MARKDOWN_V2)
+            f"   Scanned: `{len(lines)}` {item_w}\n   {esc(rw.title())}: `0`{err_note}\n\n"
+            f"{pbar(1, 1)}\n\n💰 Remaining: `{ud['credits']}`", parse_mode=ParseMode.MARKDOWN_V2)
     else:
         tag = "parsed_urls" if is_parser else "sql_vulns"
         f_out = io.BytesIO("\n".join(final).encode())
         f_out.name = f"{tag}_{datetime.now().strftime('%H%M%S')}.txt"
         await status.edit_text(
             f"{icon} *{esc(label)} — Complete*\n{DIV}\n\n"
-            f"   Scanned: `{len(lines)}` {item_w}\n"
-            f"   Results: `{len(final)}`{err_note}\n\n"
-            f"{pbar(1, 1)}\n\n💰 Remaining: `{ud['credits']}`\n\n📄 File attached below ⬇️",
-            parse_mode=ParseMode.MARKDOWN_V2)
-        await update.message.reply_document(
-            document=f_out,
-            caption=f"{icon} {len(final)} results — credits: {ud['credits']}")
+            f"   Scanned: `{len(lines)}` {item_w}\n   Results: `{len(final)}`{err_note}\n\n"
+            f"{pbar(1, 1)}\n\n💰 Remaining: `{ud['credits']}`\n\n📄 File below ⬇️", parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_document(document=f_out, caption=f"{icon} {len(final)} results — credits: {ud['credits']}")
 
 # ──────────────────────────────────────────────
 #  INPUT HANDLERS
@@ -1133,25 +1303,19 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     st = user_states.get(uid, {})
     if not st.get("mode"):
-        await update.message.reply_text(
-            "⚠️ *No mode selected\\!* Tap /start first\\.",
-            parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text("⚠️ *No mode selected\\!* Tap /start first\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
     try:
         tg_file = await context.bot.get_file(update.message.document.file_id)
         raw = await tg_file.download_as_bytearray()
         lines = [l.strip() for l in raw.decode("utf-8").splitlines() if l.strip()]
         if not lines:
-            await update.message.reply_text(
-                "⚠️ *Empty file\\!* Make sure it has one item per line\\.",
-                parse_mode=ParseMode.MARKDOWN_V2)
+            await update.message.reply_text("⚠️ *Empty file\\!*", parse_mode=ParseMode.MARKDOWN_V2)
             return
         await process_input(update, context, lines)
     except Exception as e:
         logger.error("file err: %s\n%s", e, traceback.format_exc())
-        await update.message.reply_text(
-            f"❌ *File Error:* `{esc(str(e))}`",
-            parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(f"❌ *File Error:* `{esc(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): return
