@@ -24,6 +24,9 @@ OXY_PASS = "Pika=1234pika"
 OWNER_IDS = {7214730073, 8003049490}
 DB_FILE = "users_db.json"
 PARSER_THREADS = 5
+GLOBAL_MAX_CONCURRENT = 20
+
+global_semaphore = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -203,8 +206,9 @@ async def fetch_google_suggest(session, query):
         return []
 
 async def fetch_suggest_throttled(session, query, sem):
-    async with sem:
-        return await fetch_google_suggest(session, query)
+    async with global_semaphore:
+        async with sem:
+            return await fetch_google_suggest(session, query)
 
 async def generate_keywords(session, brand, max_count, status_msg, sem):
     all_kw = set()
@@ -605,46 +609,48 @@ def get_semaphore(uid):
     return user_semaphores[uid]
 
 async def fetch_oxylabs(session, query, sem=None):
-    async with (sem or asyncio.Semaphore(PARSER_THREADS)):
-        url = "https://realtime.oxylabs.io/v1/queries"
-        payload = {
-            "source": "google_search", "query": query,
-            "user_agent_type": "desktop_chrome", "parse": True,
-            "start_page": 1, "pages": 10, "limit": 50,
-        }
-        logger.info("PARSER [thread] query: %.100s", query)
-        try:
-            async with session.post(
-                url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
-                json=payload, timeout=aiohttp.ClientTimeout(total=90),
-            ) as r:
-                body_text = await r.text()
-                if r.status != 200:
-                    logger.error("PARSER HTTP %d: %.80s — %.300s", r.status, query, body_text)
-                    return []
-                try:
-                    data = json.loads(body_text)
-                except json.JSONDecodeError as je:
-                    logger.error("PARSER JSON err: %s", je)
-                    return []
-                urls = []
-                for page in data.get("results", []):
-                    organic = page.get("content", {}).get("results", {}).get("organic", [])
-                    for item in organic:
-                        u = item.get("url")
-                        if u:
-                            urls.append(u)
-                logger.info("PARSER got %d URLs: %.80s", len(urls), query)
-                return urls
-        except asyncio.TimeoutError:
-            logger.error("PARSER timeout: %.100s", query)
-            return []
-        except aiohttp.ClientError as e:
-            logger.error("PARSER net err: %s — %s", query, e)
-            return []
-        except Exception as e:
-            logger.error("PARSER err: %s\n%s", e, traceback.format_exc())
-            return []
+    user_sem = sem or asyncio.Semaphore(PARSER_THREADS)
+    async with global_semaphore:
+        async with user_sem:
+            url = "https://realtime.oxylabs.io/v1/queries"
+            payload = {
+                "source": "google_search", "query": query,
+                "user_agent_type": "desktop_chrome", "parse": True,
+                "start_page": 1, "pages": 10, "limit": 50,
+            }
+            logger.info("PARSER [thread] query: %.100s", query)
+            try:
+                async with session.post(
+                    url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
+                    json=payload, timeout=aiohttp.ClientTimeout(total=90),
+                ) as r:
+                    body_text = await r.text()
+                    if r.status != 200:
+                        logger.error("PARSER HTTP %d: %.80s — %.300s", r.status, query, body_text)
+                        return []
+                    try:
+                        data = json.loads(body_text)
+                    except json.JSONDecodeError as je:
+                        logger.error("PARSER JSON err: %s", je)
+                        return []
+                    urls = []
+                    for page in data.get("results", []):
+                        organic = page.get("content", {}).get("results", {}).get("organic", [])
+                        for item in organic:
+                            u = item.get("url")
+                            if u:
+                                urls.append(u)
+                    logger.info("PARSER got %d URLs: %.80s", len(urls), query)
+                    return urls
+            except asyncio.TimeoutError:
+                logger.error("PARSER timeout: %.100s", query)
+                return []
+            except aiohttp.ClientError as e:
+                logger.error("PARSER net err: %s — %s", query, e)
+                return []
+            except Exception as e:
+                logger.error("PARSER err: %s\n%s", e, traceback.format_exc())
+                return []
 
 # ──────────────────────────────────────────────
 #  HELPERS
