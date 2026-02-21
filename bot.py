@@ -664,7 +664,7 @@ def is_banned(uid):
 # ──────────────────────────────────────────────
 
 WELCOME = (
-    "🌐 *Aleph Null — Sovereign Engine*\n"
+    "🐍 *𝓿𝓮𝓷𝓸𝓶 𝓭𝓾𝓶𝓹𝓲𝓷𝓰*\n"
     f"{DIV}\n\n"
     "Welcome\\! Pick a module to get started\\.\n\n"
     "📌 *Full Pipeline:*\n"
@@ -731,7 +731,7 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): return
     if not context.args:
         await update.message.reply_text(
-            "📝 *Usage:* `/redeem YOUR\\-KEY`\n\nExample: `/redeem ALEPH\\-A1B2C3D4`",
+            "📝 *Usage:* `/redeem YOUR\\-KEY`\n\nExample: `/redeem VENOM\\-A1B2C3D4`",
             parse_mode=ParseMode.MARKDOWN_V2)
         return
     uid = str(update.effective_user.id)
@@ -763,7 +763,7 @@ async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = int(context.args[0])
     except ValueError:
         await update.message.reply_text("Amount must be a number\\."); return
-    key = f"ALEPH-{uuid.uuid4().hex[:8].upper()}"
+    key = f"VENOM-{uuid.uuid4().hex[:8].upper()}"
     active_keys[key] = val
     await update.message.reply_text(
         f"🔑 *New Key*\n\n   Key: `{key}`\n   Credits: `{val}`",
