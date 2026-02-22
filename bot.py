@@ -597,9 +597,27 @@ SQL_ERRORS = [
 
 SQL_TIMEOUT = aiohttp.ClientTimeout(total=12)
 
-async def _fetch(session, url):
+BROWSER_UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+]
+
+def _make_headers():
+    return {
+        "User-Agent": random.choice(BROWSER_UAS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+    }
+
+async def _fetch(session, url, headers=None):
     try:
-        async with session.get(url, timeout=SQL_TIMEOUT, ssl=False, allow_redirects=True) as r:
+        async with session.get(url, timeout=SQL_TIMEOUT, ssl=False, allow_redirects=True, headers=headers) as r:
             body = await r.text(errors='ignore')
             return r.status, body, len(body)
     except asyncio.TimeoutError:
@@ -622,8 +640,9 @@ async def check_sql(session, url):
 
     base_part = url.split("?")[0]
     params = url.split("?")[1].split("&")
+    hdrs = _make_headers()
 
-    bs_status, bs_body, bs_len = await _fetch(session, url)
+    bs_status, bs_body, bs_len = await _fetch(session, url, hdrs)
     if bs_status <= 0:
         return None
 
@@ -636,7 +655,7 @@ async def check_sql(session, url):
         probe_hit = False
         for payload in PROBE_PAYLOADS:
             test_url = _inject_param(base_part, params, i, payload)
-            status, body, blen = await _fetch(session, test_url)
+            status, body, blen = await _fetch(session, test_url, hdrs)
             if status <= 0:
                 continue
             new_errs = set(_find_errors(body)) - bs_errors
@@ -644,7 +663,7 @@ async def check_sql(session, url):
                 probe_hit = True
                 for cp in CONFIRM_PAYLOADS:
                     cu = _inject_param(base_part, params, i, cp)
-                    cs, cb, cl = await _fetch(session, cu)
+                    cs, cb, cl = await _fetch(session, cu, hdrs)
                     if cs <= 0:
                         continue
                     cn = set(_find_errors(cb)) - bs_errors
@@ -655,7 +674,7 @@ async def check_sql(session, url):
         # ── Phase 2: Direct confirm payloads ──
         for payload in CONFIRM_PAYLOADS:
             test_url = _inject_param(base_part, params, i, payload)
-            status, body, blen = await _fetch(session, test_url)
+            status, body, blen = await _fetch(session, test_url, hdrs)
             if status <= 0:
                 continue
             new_errs = set(_find_errors(body)) - bs_errors
@@ -671,14 +690,14 @@ async def check_sql(session, url):
         for tpl, db_type in TIME_PAYLOADS:
             short_url = _inject_param(base_part, params, i, tpl.format(delay=0))
             t1 = asyncio.get_event_loop().time()
-            s1, _, _ = await _fetch(session, short_url)
+            s1, _, _ = await _fetch(session, short_url, hdrs)
             time_short = asyncio.get_event_loop().time() - t1
             if s1 <= 0:
                 continue
 
             long_url = _inject_param(base_part, params, i, tpl.format(delay=5))
             t2 = asyncio.get_event_loop().time()
-            s2, _, _ = await _fetch(session, long_url)
+            s2, _, _ = await _fetch(session, long_url, hdrs)
             time_long = asyncio.get_event_loop().time() - t2
             if s2 <= 0:
                 continue
@@ -686,7 +705,7 @@ async def check_sql(session, url):
             if time_long >= 4.5 and time_long > time_short + 3.0:
                 verify_url = _inject_param(base_part, params, i, tpl.format(delay=3))
                 t3 = asyncio.get_event_loop().time()
-                s3, _, _ = await _fetch(session, verify_url)
+                s3, _, _ = await _fetch(session, verify_url, hdrs)
                 time_v = asyncio.get_event_loop().time() - t3
                 if time_v >= 2.5 and time_v > time_short + 1.5:
                     return f"[VULN:Time-Blind({db_type})] [param:{pname}] {url}"
